@@ -4,6 +4,8 @@ UBlueprintGraphExportSettings::UBlueprintGraphExportSettings()
 {
 	bEnableAutoExportOnSave = true;
 	bPrettyPrintJson = true;
+	bIncludeGraphVisualizationInMarkdown = true;
+	MaxVisualizationNodeCount = 80;
 	bEnableStartupFullSync = true;
 	bOnlyRunStartupSyncWhenStale = true;
 	StartupSyncDelaySeconds = 0.0f;
@@ -33,7 +35,7 @@ FText UBlueprintGraphExportSettings::GetSectionDescription() const
 	return NSLOCTEXT(
 		"BlueprintGraphExport",
 		"SettingsSectionDescription",
-		"Controls automatic Blueprint and DataAsset markdown or JSON exports. Relative output paths are resolved against the configured output base directory, which defaults to the project directory."
+		"Controls automatic Blueprint and DataAsset markdown or JSON exports, including optional Mermaid graph visualizations. Relative output paths are resolved against the configured output base directory, which defaults to the project directory."
 	);
 }
 #endif

@@ -3,8 +3,11 @@
 #include "Algo/Unique.h"
 #include "AssetRegistry/AssetData.h"
 #include "AssetRegistry/AssetRegistryModule.h"
+#include "BlueprintGraphExportLibraryInternal.h"
 #include "BlueprintGraphExportSettings.h"
 #include "BlueprintGraphExportPathUtils.h"
+#include "Containers/Map.h"
+#include "Containers/Set.h"
 #include "Dom/JsonObject.h"
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
@@ -736,11 +739,230 @@ namespace BlueprintGraphExport
 	{
 		Lines.Add(FString::Printf(TEXT("- %s: %s"), *Label, *JoinAsBacktickList(Values)));
 	}
+
+	static FString GetShortNameFromPath(const FString& ObjectPath)
+	{
+		int32 SeparatorIndex = INDEX_NONE;
+		if (ObjectPath.FindLastChar(TEXT('.'), SeparatorIndex))
+		{
+			return ObjectPath.Mid(SeparatorIndex + 1);
+		}
+		if (ObjectPath.FindLastChar(TEXT('/'), SeparatorIndex))
+		{
+			return ObjectPath.Mid(SeparatorIndex + 1);
+		}
+		return ObjectPath;
+	}
+
+	static FString EscapeMermaidLabel(const FString& Text)
+	{
+		FString Escaped = NormalizeMultilineForMarkdown(Text);
+		Escaped.ReplaceInline(TEXT("&"), TEXT("&amp;"));
+		Escaped.ReplaceInline(TEXT("<"), TEXT("&lt;"));
+		Escaped.ReplaceInline(TEXT(">"), TEXT("&gt;"));
+		Escaped.ReplaceInline(TEXT("\""), TEXT("&quot;"));
+		Escaped.ReplaceInline(TEXT("\\"), TEXT("&#92;"));
+		Escaped.ReplaceInline(TEXT("\n"), TEXT("<br/>"));
+		return Escaped;
+	}
+
+	static FString MakeMermaidSafeNodeId(const FString& NodeGuid, const int32 FallbackIndex)
+	{
+		const FString Source = NodeGuid.IsEmpty()
+			? FString::Printf(TEXT("Node_%03d"), FallbackIndex)
+			: NodeGuid;
+
+		FString Sanitized;
+		Sanitized.Reserve(Source.Len());
+		for (const TCHAR Character : Source)
+		{
+			Sanitized.AppendChar(FChar::IsAlnum(Character) ? Character : TEXT('_'));
+		}
+
+		return FString::Printf(TEXT("N_%s"), *Sanitized);
+	}
+
+	static FString GetMermaidNodeLabel(const TSharedPtr<FJsonObject>& NodeObject, const int32 FallbackIndex)
+	{
+		if (!NodeObject.IsValid())
+		{
+			return FString::Printf(TEXT("Node %03d"), FallbackIndex);
+		}
+
+		const FString NodeTitle = NodeObject->GetStringField(TEXT("node_title"));
+		if (!NodeTitle.IsEmpty())
+		{
+			return NodeTitle;
+		}
+
+		const FString ShortClassName = GetShortNameFromPath(NodeObject->GetStringField(TEXT("node_class")));
+		if (!ShortClassName.IsEmpty())
+		{
+			return ShortClassName;
+		}
+
+		return FString::Printf(TEXT("Node %03d"), FallbackIndex);
+	}
+
+	static bool BuildGraphMermaidFlowchart(
+		const TSharedPtr<FJsonObject>& GraphObject,
+		const int32 MaxNodeCount,
+		FString& OutMermaid,
+		FString& OutReason
+	)
+	{
+		OutMermaid.Reset();
+		OutReason.Reset();
+
+		if (!GraphObject.IsValid())
+		{
+			OutReason = TEXT("Visualization unavailable for this graph.");
+			return false;
+		}
+
+		const TArray<TSharedPtr<FJsonValue>>* NodeValues = nullptr;
+		if (!GraphObject->TryGetArrayField(TEXT("nodes"), NodeValues) || !NodeValues)
+		{
+			OutReason = TEXT("Visualization unavailable for this graph.");
+			return false;
+		}
+
+		if (NodeValues->Num() <= 0)
+		{
+			OutReason = TEXT("Visualization skipped: graph has no nodes.");
+			return false;
+		}
+
+		if (NodeValues->Num() > MaxNodeCount)
+		{
+			OutReason = FString::Printf(
+				TEXT("Visualization skipped: graph has %d nodes, which exceeds the configured limit of %d."),
+				NodeValues->Num(),
+				MaxNodeCount
+			);
+			return false;
+		}
+
+		TMap<FString, FString> GuidToNodeId;
+		TArray<FString> NodeLines;
+		NodeLines.Reserve(NodeValues->Num());
+
+		int32 NodeIndex = 0;
+		for (const TSharedPtr<FJsonValue>& NodeValue : *NodeValues)
+		{
+			++NodeIndex;
+			const TSharedPtr<FJsonObject> NodeObject = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
+			if (!NodeObject.IsValid())
+			{
+				continue;
+			}
+
+			const FString NodeGuid = NodeObject->GetStringField(TEXT("node_guid"));
+			const FString NodeId = MakeMermaidSafeNodeId(NodeGuid, NodeIndex);
+			const FString NodeLabel = EscapeMermaidLabel(GetMermaidNodeLabel(NodeObject, NodeIndex));
+
+			NodeLines.Add(FString::Printf(TEXT("    %s[\"%s\"]"), *NodeId, *NodeLabel));
+			if (!NodeGuid.IsEmpty())
+			{
+				GuidToNodeId.Add(NodeGuid, NodeId);
+			}
+		}
+
+		if (NodeLines.IsEmpty())
+		{
+			OutReason = TEXT("Visualization unavailable for this graph.");
+			return false;
+		}
+
+		TSet<FString> UniqueEdges;
+		TArray<FString> EdgeLines;
+		NodeIndex = 0;
+		for (const TSharedPtr<FJsonValue>& NodeValue : *NodeValues)
+		{
+			++NodeIndex;
+			const TSharedPtr<FJsonObject> NodeObject = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
+			if (!NodeObject.IsValid())
+			{
+				continue;
+			}
+
+			const FString SourceGuid = NodeObject->GetStringField(TEXT("node_guid"));
+			const FString* SourceNodeId = GuidToNodeId.Find(SourceGuid);
+			if (!SourceNodeId)
+			{
+				continue;
+			}
+
+			const TArray<TSharedPtr<FJsonValue>>* PinValues = nullptr;
+			if (!NodeObject->TryGetArrayField(TEXT("pins"), PinValues) || !PinValues)
+			{
+				continue;
+			}
+
+			for (const TSharedPtr<FJsonValue>& PinValue : *PinValues)
+			{
+				const TSharedPtr<FJsonObject> PinObject = PinValue.IsValid() ? PinValue->AsObject() : nullptr;
+				if (!PinObject.IsValid())
+				{
+					continue;
+				}
+
+				const TArray<TSharedPtr<FJsonValue>>* LinkedToValues = nullptr;
+				if (!PinObject->TryGetArrayField(TEXT("linked_to"), LinkedToValues) || !LinkedToValues)
+				{
+					continue;
+				}
+
+				for (const TSharedPtr<FJsonValue>& LinkValue : *LinkedToValues)
+				{
+					const TSharedPtr<FJsonObject> LinkObject = LinkValue.IsValid() ? LinkValue->AsObject() : nullptr;
+					if (!LinkObject.IsValid())
+					{
+						continue;
+					}
+
+					FString TargetGuid;
+					if (!LinkObject->TryGetStringField(TEXT("target_node_guid"), TargetGuid) || TargetGuid.IsEmpty())
+					{
+						continue;
+					}
+
+					const FString* TargetNodeId = GuidToNodeId.Find(TargetGuid);
+					if (!TargetNodeId)
+					{
+						continue;
+					}
+
+					const FString EdgeKey = FString::Printf(TEXT("%s-->%s"), **SourceNodeId, **TargetNodeId);
+					if (UniqueEdges.Contains(EdgeKey))
+					{
+						continue;
+					}
+
+					UniqueEdges.Add(EdgeKey);
+					EdgeLines.Add(FString::Printf(TEXT("    %s --> %s"), **SourceNodeId, **TargetNodeId));
+				}
+			}
+		}
+
+		TArray<FString> MermaidLines;
+		MermaidLines.Reserve(1 + NodeLines.Num() + EdgeLines.Num());
+		MermaidLines.Add(TEXT("flowchart LR"));
+		MermaidLines.Append(NodeLines);
+		MermaidLines.Append(EdgeLines);
+
+		OutMermaid = FString::Join(MermaidLines, TEXT("\n"));
+		return true;
+	}
+
 	static FString BuildBlueprintMarkdown(const TSharedPtr<FJsonObject>& AssetObject)
 	{
 		const FString AssetPath = AssetObject->GetStringField(TEXT("asset_path"));
 		const TArray<TSharedPtr<FJsonValue>>* GraphValues = nullptr;
 		AssetObject->TryGetArrayField(TEXT("graphs"), GraphValues);
+		const UBlueprintGraphExportSettings* Settings = GetDefault<UBlueprintGraphExportSettings>();
+		const bool bIncludeVisualization = Settings ? Settings->bIncludeGraphVisualizationInMarkdown : true;
+		const int32 MaxVisualizationNodeCount = (Settings && Settings->MaxVisualizationNodeCount > 0) ? Settings->MaxVisualizationNodeCount : 80;
 
 		TArray<FString> Lines;
 		Lines.Add(FString::Printf(TEXT("# `%s`"), *EscapeMarkdown(AssetPath)));
@@ -790,6 +1012,26 @@ namespace BlueprintGraphExport
 				Lines.Add(FString::Printf(TEXT("- schema_class: `%s`"), *EscapeMarkdown(GraphObject->GetStringField(TEXT("schema_class")))));
 				Lines.Add(FString::Printf(TEXT("- node_count: `%d`"), static_cast<int32>(GraphObject->GetNumberField(TEXT("node_count")))));
 				Lines.Add(TEXT(""));
+
+				if (bIncludeVisualization)
+				{
+					Lines.Add(TEXT("#### Visualization"));
+					Lines.Add(TEXT(""));
+
+					FString MermaidGraph;
+					FString VisualizationReason;
+					if (BuildGraphMermaidFlowchart(GraphObject, MaxVisualizationNodeCount, MermaidGraph, VisualizationReason))
+					{
+						Lines.Add(TEXT("```mermaid"));
+						Lines.Add(MermaidGraph);
+						Lines.Add(TEXT("```"));
+					}
+					else
+					{
+						Lines.Add(VisualizationReason.IsEmpty() ? TEXT("Visualization unavailable for this graph.") : VisualizationReason);
+					}
+					Lines.Add(TEXT(""));
+				}
 
 				const TArray<TSharedPtr<FJsonValue>>* NodeValues = nullptr;
 				if (GraphObject->TryGetArrayField(TEXT("nodes"), NodeValues) && NodeValues)
@@ -1007,6 +1249,95 @@ namespace BlueprintGraphExport
 		return SaveTextToPath(Markdown, ResolvedOutputPath, OutResolvedPath, OutError);
 	}
 
+	static bool ExportAssetsUnderPathToDocumentation(
+		const FString& RootAssetPath,
+		const FString& DocumentationRootDir,
+		const FString& JsonOutputDir,
+		const bool bRecursive,
+		const bool bPrettyPrintJson,
+		FString& OutResolvedDir,
+		FString& OutError
+	)
+	{
+		OutResolvedDir.Reset();
+		OutError.Reset();
+
+		if (!IsValidRootAssetPath(RootAssetPath, OutError))
+		{
+			return false;
+		}
+
+		const FString ResolvedDocumentationRootDir = DocumentationRootDir.IsEmpty()
+			? GetDefaultDocumentationRootDir()
+			: BlueprintGraphExportPathUtils::ResolvePathAgainstOutputBase(DocumentationRootDir);
+		if (!IFileManager::Get().MakeDirectory(*ResolvedDocumentationRootDir, true))
+		{
+			OutError = FString::Printf(TEXT("Failed to create documentation root directory: %s"), *ResolvedDocumentationRootDir);
+			return false;
+		}
+
+		const FString ResolvedJsonOutputDir = JsonOutputDir.IsEmpty()
+			? GetDefaultJsonMirrorRootDir()
+			: BlueprintGraphExportPathUtils::ResolvePathAgainstOutputBase(JsonOutputDir);
+
+		TArray<FAssetData> AssetDataList = CollectSupportedAssetDataUnderRoot(RootAssetPath, bRecursive, OutError);
+		if (!OutError.IsEmpty())
+		{
+			return false;
+		}
+
+		bool bSucceeded = true;
+		FString FirstError;
+		for (const FAssetData& AssetData : AssetDataList)
+		{
+			if (UObject* Asset = AssetData.GetAsset())
+			{
+				FString MarkdownPath;
+				FString JsonPath;
+				FString Error;
+				if (!UBlueprintGraphExportLibrary::ExportAssetDocumentationBundle(
+					Asset,
+					ResolvedDocumentationRootDir,
+					ResolvedJsonOutputDir,
+					bPrettyPrintJson,
+					MarkdownPath,
+					JsonPath,
+					Error
+				))
+				{
+					bSucceeded = false;
+					if (!Error.IsEmpty())
+					{
+						UE_LOG(LogBlueprintGraphExport, Warning, TEXT("%s"), *Error);
+						if (FirstError.IsEmpty())
+						{
+							FirstError = Error;
+						}
+					}
+				}
+			}
+			else
+			{
+				const FString Error = FString::Printf(TEXT("Failed to load asset for documentation export: %s"), *AssetData.PackageName.ToString());
+				UE_LOG(LogBlueprintGraphExport, Warning, TEXT("%s"), *Error);
+				bSucceeded = false;
+				if (FirstError.IsEmpty())
+				{
+					FirstError = Error;
+				}
+			}
+		}
+
+		OutResolvedDir = ResolvedDocumentationRootDir;
+		if (!bSucceeded)
+		{
+			OutError = FirstError.IsEmpty()
+				? FString::Printf(TEXT("One or more assets under %s failed to export."), *RootAssetPath)
+				: FirstError;
+		}
+		return bSucceeded;
+	}
+
 	static FString BuildDocumentationIndexMarkdown(const FString& DocumentationRootDir, const TArray<TSharedPtr<FJsonObject>>& AssetObjects)
 	{
 		TArray<FString> Lines;
@@ -1184,50 +1515,34 @@ bool UBlueprintGraphExportLibrary::ExportAssetsUnderPathToMarkdown(
 	OutResolvedDir.Reset();
 	OutError.Reset();
 
-	if (!BlueprintGraphExport::IsValidRootAssetPath(RootAssetPath, OutError))
-	{
-		return false;
-	}
-
-	const FString DocumentationRootDir = OutputRootDir.IsEmpty() ? BlueprintGraphExport::GetDefaultDocumentationRootDir() : BlueprintGraphExportPathUtils::ResolvePathAgainstOutputBase(OutputRootDir);
-	if (!IFileManager::Get().MakeDirectory(*DocumentationRootDir, true))
-	{
-		OutError = FString::Printf(TEXT("Failed to create documentation root directory: %s"), *DocumentationRootDir);
-		return false;
-	}
-
-	TArray<FAssetData> AssetDataList = BlueprintGraphExport::CollectSupportedAssetDataUnderRoot(RootAssetPath, bRecursive, OutError);
-	if (!OutError.IsEmpty())
-	{
-		return false;
-	}
-
 	const UBlueprintGraphExportSettings* Settings = GetDefault<UBlueprintGraphExportSettings>();
 	const bool bPrettyPrintJson = Settings ? Settings->bPrettyPrintJson : true;
+	const FString DocumentationRootDir = OutputRootDir.IsEmpty()
+		? BlueprintGraphExport::GetDefaultDocumentationRootDir()
+		: BlueprintGraphExportPathUtils::ResolvePathAgainstOutputBase(OutputRootDir);
+	const FString JsonOutputDir = BlueprintGraphExport::GetDefaultJsonMirrorRootDir();
 
-	for (const FAssetData& AssetData : AssetDataList)
+	if (!BlueprintGraphExport::ExportAssetsUnderPathToDocumentation(
+		RootAssetPath,
+		DocumentationRootDir,
+		JsonOutputDir,
+		bRecursive,
+		bPrettyPrintJson,
+		OutResolvedDir,
+		OutError
+	))
 	{
-		if (UObject* Asset = AssetData.GetAsset())
-		{
-			FString MarkdownPath;
-			FString JsonPath;
-			FString Error;
-			if (!ExportAssetDocumentationBundle(Asset, DocumentationRootDir, FString(), bPrettyPrintJson, MarkdownPath, JsonPath, Error) && !Error.IsEmpty())
-			{
-				UE_LOG(LogBlueprintGraphExport, Warning, TEXT("%s"), *Error);
-			}
-		}
+		return false;
 	}
 
 	FString IndexPath;
 	FString IndexError;
-	RebuildDocumentationIndex(DocumentationRootDir, IndexPath, IndexError);
-	if (!IndexError.IsEmpty())
+	if (!RebuildDocumentationIndex(DocumentationRootDir, IndexPath, IndexError))
 	{
-		UE_LOG(LogBlueprintGraphExport, Warning, TEXT("%s"), *IndexError);
+		OutError = IndexError;
+		return false;
 	}
 
-	OutResolvedDir = DocumentationRootDir;
 	return true;
 }
 
@@ -1241,14 +1556,29 @@ bool UBlueprintGraphExportLibrary::RebuildDocumentationIndex(
 	OutError.Reset();
 
 	const FString DocumentationRootDir = DocsRootDir.IsEmpty() ? BlueprintGraphExport::GetDefaultDocumentationRootDir() : BlueprintGraphExportPathUtils::ResolvePathAgainstOutputBase(DocsRootDir);
+	const UBlueprintGraphExportSettings* Settings = GetDefault<UBlueprintGraphExportSettings>();
+	const TArray<FString> RootPaths = Settings ? Settings->RootAssetPaths : TArray<FString>{ TEXT("/Game") };
+	return BlueprintGraphExportInternal::RebuildDocumentationIndexForRoots(RootPaths, DocumentationRootDir, OutIndexPath, OutError);
+}
+
+bool BlueprintGraphExportInternal::RebuildDocumentationIndexForRoots(
+	const TArray<FString>& RootPaths,
+	const FString& DocsRootDir,
+	FString& OutIndexPath,
+	FString& OutError
+)
+{
+	OutIndexPath.Reset();
+	OutError.Reset();
+
+	const FString DocumentationRootDir = DocsRootDir.IsEmpty()
+		? BlueprintGraphExport::GetDefaultDocumentationRootDir()
+		: BlueprintGraphExportPathUtils::ResolvePathAgainstOutputBase(DocsRootDir);
 	if (!IFileManager::Get().MakeDirectory(*DocumentationRootDir, true))
 	{
 		OutError = FString::Printf(TEXT("Failed to create documentation root directory: %s"), *DocumentationRootDir);
 		return false;
 	}
-
-	const UBlueprintGraphExportSettings* Settings = GetDefault<UBlueprintGraphExportSettings>();
-	const TArray<FString> RootPaths = Settings ? Settings->RootAssetPaths : TArray<FString>{ TEXT("/Game") };
 
 	TArray<TSharedPtr<FJsonObject>> AssetObjects;
 	for (const FString& RootPath : RootPaths)

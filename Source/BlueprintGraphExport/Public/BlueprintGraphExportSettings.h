@@ -25,6 +25,12 @@ public:
 	UPROPERTY(EditAnywhere, Config, Category = "Automation")
 	bool bPrettyPrintJson;
 
+	UPROPERTY(EditAnywhere, Config, Category = "Markdown")
+	bool bIncludeGraphVisualizationInMarkdown;
+
+	UPROPERTY(EditAnywhere, Config, Category = "Markdown", meta = (ClampMin = "1", ToolTip = "Graphs with more than this many nodes skip inline Mermaid visualization to keep markdown readable."))
+	int32 MaxVisualizationNodeCount;
+
 	UPROPERTY(EditAnywhere, Config, Category = "Startup Sync")
 	bool bEnableStartupFullSync;
 

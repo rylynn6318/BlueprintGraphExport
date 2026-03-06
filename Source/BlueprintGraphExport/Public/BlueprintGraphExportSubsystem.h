@@ -29,11 +29,12 @@ private:
 	bool HandleStartupSyncTicker(float DeltaTime);
 
 	bool IsManagedPackagePath(const FString& PackagePath) const;
-	void ExportManagedAssetsInPackage(UPackage* Package);
-	void RebuildIndex() const;
+	bool ExportManagedAssetsInPackage(UPackage* Package, FString& OutError);
+	bool RebuildIndex(FString& OutIndexPath, FString& OutError) const;
+	bool RefreshStartupSyncManifest(FString& OutManifestPath, int32& OutSupportedAssetCount, FString& OutError) const;
 	void ScheduleStartupSync();
 	bool ShouldRunStartupFullSync(FString& OutReason, int32& OutSupportedAssetCount) const;
-	bool RunStartupFullSync(int32 SupportedAssetCount);
+	bool RunStartupFullSync();
 	void CancelScheduledStartupSync();
 	int32 GetManagedSupportedAssetCount() const;
 

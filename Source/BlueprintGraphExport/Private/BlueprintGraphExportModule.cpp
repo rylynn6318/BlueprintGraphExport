@@ -1,5 +1,5 @@
 #include "BlueprintGraphExportSubsystem.h"
-#include "Editor.h"
+#include "BlueprintGraphExportSyncRunner.h"
 #include "HAL/IConsoleManager.h"
 #include "Modules/ModuleManager.h"
 #include "Templates/UniquePtr.h"
@@ -24,23 +24,20 @@ public:
 private:
 	void ExecuteSyncAllDocs()
 	{
-		if (!GEditor)
+		const FBlueprintGraphExportSyncResult Result = FBlueprintGraphExportSyncRunner::RunFullSync(
+			FBlueprintGraphExportSyncRunner::MakeOptionsFromSettings()
+		);
+		if (Result.Status == EBlueprintGraphExportSyncStatus::Success)
 		{
-			UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("BlueprintGraphExport.SyncAllDocs failed: editor subsystem is unavailable."));
-			return;
+			UE_LOG(LogBlueprintGraphExportSubsystem, Display, TEXT("BlueprintGraphExport.SyncAllDocs completed: %s"), *Result.Reason);
 		}
-
-		UBlueprintGraphExportSubsystem* ExportSubsystem = GEditor->GetEditorSubsystem<UBlueprintGraphExportSubsystem>();
-		if (!ExportSubsystem)
+		else if (Result.Status == EBlueprintGraphExportSyncStatus::SkippedUpToDate)
 		{
-			UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("BlueprintGraphExport.SyncAllDocs failed: BlueprintGraphExport subsystem is unavailable."));
-			return;
+			UE_LOG(LogBlueprintGraphExportSubsystem, Display, TEXT("BlueprintGraphExport.SyncAllDocs skipped: %s"), *Result.Reason);
 		}
-
-		FString Result;
-		if (!ExportSubsystem->RunManualFullSync(Result) && !Result.IsEmpty())
+		else if (!Result.Reason.IsEmpty())
 		{
-			UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("BlueprintGraphExport.SyncAllDocs failed: %s"), *Result);
+			UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("BlueprintGraphExport.SyncAllDocs failed: %s"), *Result.Reason);
 		}
 	}
 

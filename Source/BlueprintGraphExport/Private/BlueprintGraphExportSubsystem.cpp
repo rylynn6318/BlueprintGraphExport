@@ -3,9 +3,13 @@
 #include "AssetRegistry/AssetData.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "BlueprintGraphExportLibrary.h"
+#include "BlueprintGraphExportLibraryInternal.h"
 #include "BlueprintGraphExportSettings.h"
+#include "BlueprintGraphExportSyncRunner.h"
 #include "BlueprintGraphExportPathUtils.h"
 #include "Dom/JsonObject.h"
+#include "Engine/Blueprint.h"
+#include "Engine/DataAsset.h"
 #include "HAL/FileManager.h"
 #include "Misc/DateTime.h"
 #include "Misc/FileHelper.h"
@@ -80,27 +84,51 @@ namespace BlueprintGraphExportSubsystem
 		return Asset && (Cast<UBlueprint>(Asset) || Cast<UDataAsset>(Asset));
 	}
 
-	static TArray<FAssetData> CollectSupportedAssetsUnderRoot(IAssetRegistry& AssetRegistry, const FString& RootAssetPath)
+	static TArray<FAssetData> CollectSupportedAssetsUnderRoot(
+		IAssetRegistry& AssetRegistry,
+		const FString& RootAssetPath,
+		const bool bRecursive = true,
+		FString* OutError = nullptr
+	)
 	{
 		TArray<FAssetData> SupportedAssets;
+		if (OutError)
+		{
+			OutError->Reset();
+		}
 
 		FText ValidationError;
 		if (!FPackageName::IsValidLongPackageName(RootAssetPath, false, &ValidationError))
 		{
-			UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("Invalid root asset path for startup sync: %s (%s)"), *RootAssetPath, *ValidationError.ToString());
+			const FString Error = FString::Printf(TEXT("Invalid root asset path for startup sync: %s (%s)"), *RootAssetPath, *ValidationError.ToString());
+			UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("%s"), *Error);
+			if (OutError)
+			{
+				*OutError = Error;
+			}
 			return SupportedAssets;
 		}
 
 		if (!AssetRegistry.PathExists(FName(*RootAssetPath)))
 		{
-			UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("Startup sync root asset path does not exist: %s"), *RootAssetPath);
+			const FString Error = FString::Printf(TEXT("Startup sync root asset path does not exist: %s"), *RootAssetPath);
+			UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("%s"), *Error);
+			if (OutError)
+			{
+				*OutError = Error;
+			}
 			return SupportedAssets;
 		}
 
 		TArray<FAssetData> AssetDataList;
-		if (!AssetRegistry.GetAssetsByPath(FName(*RootAssetPath), AssetDataList, true, false))
+		if (!AssetRegistry.GetAssetsByPath(FName(*RootAssetPath), AssetDataList, bRecursive, false))
 		{
-			UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("Failed to enumerate assets under startup sync root path: %s"), *RootAssetPath);
+			const FString Error = FString::Printf(TEXT("Failed to enumerate assets under startup sync root path: %s"), *RootAssetPath);
+			UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("%s"), *Error);
+			if (OutError)
+			{
+				*OutError = Error;
+			}
 			return SupportedAssets;
 		}
 
@@ -230,11 +258,208 @@ namespace BlueprintGraphExportSubsystem
 
 		return true;
 	}
+
+	static bool GetManifestPackagePaths(const TSharedPtr<FJsonObject>& ManifestObject, TSet<FString>& OutPackagePaths)
+	{
+		OutPackagePaths.Reset();
+		if (!ManifestObject.IsValid())
+		{
+			return false;
+		}
+
+		const TArray<TSharedPtr<FJsonValue>>* AssetValues = nullptr;
+		if (!ManifestObject->TryGetArrayField(TEXT("assets"), AssetValues) || !AssetValues)
+		{
+			return false;
+		}
+
+		for (const TSharedPtr<FJsonValue>& AssetValue : *AssetValues)
+		{
+			const TSharedPtr<FJsonObject> AssetObject = AssetValue.IsValid() ? AssetValue->AsObject() : nullptr;
+			if (!AssetObject.IsValid())
+			{
+				continue;
+			}
+
+			FString PackagePath;
+			if (AssetObject->TryGetStringField(TEXT("package_path"), PackagePath) && !PackagePath.IsEmpty())
+			{
+				OutPackagePaths.Add(PackagePath);
+			}
+		}
+
+		return true;
+	}
+
+	static bool ExportAssetsUnderRoot(
+		const FString& RootAssetPath,
+		const FString& DocumentationRootDir,
+		const FString& JsonOutputDir,
+		const bool bRecursive,
+		const bool bPrettyPrintJson,
+		FString& OutError
+	)
+	{
+		OutError.Reset();
+
+		if (!IFileManager::Get().MakeDirectory(*DocumentationRootDir, true))
+		{
+			OutError = FString::Printf(TEXT("Failed to create documentation root directory: %s"), *DocumentationRootDir);
+			return false;
+		}
+
+		FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+		IAssetRegistry& AssetRegistry = AssetRegistryModule.Get();
+
+		FString RootError;
+		const TArray<FAssetData> AssetDataList = CollectSupportedAssetsUnderRoot(AssetRegistry, RootAssetPath, bRecursive, &RootError);
+		if (!RootError.IsEmpty())
+		{
+			OutError = RootError;
+			return false;
+		}
+
+		bool bSucceeded = true;
+		FString FirstError;
+		for (const FAssetData& AssetData : AssetDataList)
+		{
+			UObject* Asset = AssetData.FastGetAsset(false);
+			if (!Asset)
+			{
+				Asset = AssetData.GetAsset();
+			}
+
+			if (!Asset)
+			{
+				const FString Error = FString::Printf(TEXT("Failed to load asset for documentation export: %s"), *AssetData.PackageName.ToString());
+				UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("%s"), *Error);
+				bSucceeded = false;
+				if (FirstError.IsEmpty())
+				{
+					FirstError = Error;
+				}
+				continue;
+			}
+
+			FString MarkdownPath;
+			FString JsonPath;
+			FString Error;
+			if (!UBlueprintGraphExportLibrary::ExportAssetDocumentationBundle(
+				Asset,
+				DocumentationRootDir,
+				JsonOutputDir,
+				bPrettyPrintJson,
+				MarkdownPath,
+				JsonPath,
+				Error
+			))
+			{
+				bSucceeded = false;
+				if (!Error.IsEmpty())
+				{
+					UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("%s"), *Error);
+					if (FirstError.IsEmpty())
+					{
+						FirstError = Error;
+					}
+				}
+			}
+		}
+
+		if (!bSucceeded)
+		{
+			OutError = FirstError.IsEmpty()
+				? FString::Printf(TEXT("One or more assets under %s failed to export."), *RootAssetPath)
+				: FirstError;
+		}
+		return bSucceeded;
+	}
+
+	static bool RemoveOrphanedDocumentationBundles(
+		const TArray<FAssetData>& CurrentAssets,
+		const FString& DocumentationRootDir,
+		const FString& JsonOutputDir,
+		const FString& ManifestPath,
+		FString& OutError
+	)
+	{
+		OutError.Reset();
+		if (!IFileManager::Get().FileExists(*ManifestPath))
+		{
+			return true;
+		}
+
+		TSharedPtr<FJsonObject> ExistingManifest;
+		if (!LoadJsonObjectFromFile(ManifestPath, ExistingManifest) || !ExistingManifest.IsValid())
+		{
+			OutError = FString::Printf(TEXT("Startup sync manifest could not be parsed for orphan cleanup: %s"), *ManifestPath);
+			return false;
+		}
+
+		TSet<FString> ManifestPackagePaths;
+		if (!GetManifestPackagePaths(ExistingManifest, ManifestPackagePaths))
+		{
+			OutError = FString::Printf(TEXT("Startup sync manifest is missing asset package data for orphan cleanup: %s"), *ManifestPath);
+			return false;
+		}
+
+		TSet<FString> CurrentPackagePaths;
+		for (const FAssetData& AssetData : CurrentAssets)
+		{
+			CurrentPackagePaths.Add(AssetData.PackageName.ToString());
+		}
+
+		bool bSucceeded = true;
+		FString FirstError;
+		for (const FString& PackagePath : ManifestPackagePaths)
+		{
+			if (CurrentPackagePaths.Contains(PackagePath))
+			{
+				continue;
+			}
+
+			FString RemovedMarkdownPath;
+			FString RemovedJsonPath;
+			FString Error;
+			if (!UBlueprintGraphExportLibrary::RemoveAssetDocumentationBundle(
+				PackagePath,
+				DocumentationRootDir,
+				JsonOutputDir,
+				RemovedMarkdownPath,
+				RemovedJsonPath,
+				Error
+			))
+			{
+				bSucceeded = false;
+				if (!Error.IsEmpty())
+				{
+					UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("%s"), *Error);
+					if (FirstError.IsEmpty())
+					{
+						FirstError = Error;
+					}
+				}
+			}
+		}
+
+		if (!bSucceeded)
+		{
+			OutError = FirstError.IsEmpty()
+				? FString::Printf(TEXT("Failed to remove one or more orphaned documentation bundles from %s"), *ManifestPath)
+				: FirstError;
+		}
+		return bSucceeded;
+	}
 }
 
 void UBlueprintGraphExportSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
+
+	if (IsRunningCommandlet())
+	{
+		return;
+	}
 
 	UPackage::PackageSavedWithContextEvent.AddUObject(this, &UBlueprintGraphExportSubsystem::HandlePackageSaved);
 
@@ -296,43 +521,34 @@ bool UBlueprintGraphExportSubsystem::RunManualFullSync(FString& OutReasonOrError
 	}
 
 	CancelScheduledStartupSync();
-
-	FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
-	IAssetRegistry& AssetRegistry = AssetRegistryModule.Get();
-	if (!AssetRegistry.IsSearchAllAssets())
-	{
-		AssetRegistry.SearchAllAssets(true);
-	}
-	if (AssetRegistry.IsLoadingAssets())
-	{
-		AssetRegistry.WaitForCompletion();
-	}
-
-	const UBlueprintGraphExportSettings* Settings = GetDefault<UBlueprintGraphExportSettings>();
-	const int32 RootPathCount = Settings ? Settings->RootAssetPaths.Num() : 0;
-	const int32 SupportedAssetCount = GetManagedSupportedAssetCount();
-
-	UE_LOG(LogBlueprintGraphExportSubsystem, Display, TEXT("Manual documentation sync started for %d supported assets across %d root paths."), SupportedAssetCount, RootPathCount);
 	bStartupSyncInProgress = true;
-	const bool bSucceeded = RunStartupFullSync(SupportedAssetCount);
+	const FBlueprintGraphExportSyncResult Result = FBlueprintGraphExportSyncRunner::RunFullSync(
+		FBlueprintGraphExportSyncRunner::MakeOptionsFromSettings()
+	);
 	bStartupSyncInProgress = false;
 
-	const FString DocumentationRootDir = BlueprintGraphExportSubsystem::ResolveDirectorySetting(Settings ? Settings->DocumentationRootDir : FString(), BlueprintGraphExportSubsystem::GetDefaultDocumentationRootDir());
-	const FString ManifestPath = BlueprintGraphExportSubsystem::ResolveFileSetting(Settings ? Settings->StartupSyncManifestPath : FString(), BlueprintGraphExportSubsystem::GetDefaultManifestPath());
-	const FString IndexPath = BlueprintGraphExportSubsystem::GetIndexPath(DocumentationRootDir);
-
-	if (bSucceeded)
+	if (Result.Status == EBlueprintGraphExportSyncStatus::Success)
 	{
-		OutReasonOrError = FString::Printf(TEXT("Manual documentation sync completed for %d supported assets. Index: %s Manifest: %s"), SupportedAssetCount, *IndexPath, *ManifestPath);
+		OutReasonOrError = FString::Printf(
+			TEXT("Manual documentation sync completed for %d supported assets. Index: %s Manifest: %s"),
+			Result.SupportedAssetCount,
+			*Result.IndexPath,
+			*Result.ManifestPath
+		);
 		UE_LOG(LogBlueprintGraphExportSubsystem, Display, TEXT("%s"), *OutReasonOrError);
+		return true;
+	}
+
+	if (!Result.Reason.IsEmpty())
+	{
+		OutReasonOrError = Result.Reason;
 	}
 	else
 	{
 		OutReasonOrError = TEXT("Manual documentation sync completed with errors. See previous log entries.");
-		UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("%s"), *OutReasonOrError);
 	}
-
-	return bSucceeded;
+	UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("%s"), *OutReasonOrError);
+	return false;
 }
 
 bool UBlueprintGraphExportSubsystem::IsManagedPackagePath(const FString& PackagePath) const
@@ -368,8 +584,34 @@ void UBlueprintGraphExportSubsystem::HandlePackageSaved(const FString& PackageFi
 		return;
 	}
 
-	ExportManagedAssetsInPackage(Package);
-	RebuildIndex();
+	FString ExportError;
+	if (!ExportManagedAssetsInPackage(Package, ExportError))
+	{
+		if (!ExportError.IsEmpty())
+		{
+			UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("%s"), *ExportError);
+		}
+		return;
+	}
+
+	FString IndexPath;
+	FString IndexError;
+	if (!RebuildIndex(IndexPath, IndexError))
+	{
+		if (!IndexError.IsEmpty())
+		{
+			UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("%s"), *IndexError);
+		}
+		return;
+	}
+
+	FString ManifestPath;
+	int32 SupportedAssetCount = 0;
+	FString ManifestError;
+	if (!RefreshStartupSyncManifest(ManifestPath, SupportedAssetCount, ManifestError) && !ManifestError.IsEmpty())
+	{
+		UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("%s"), *ManifestError);
+	}
 }
 
 void UBlueprintGraphExportSubsystem::HandleAssetRemoved(const FAssetData& AssetData)
@@ -389,21 +631,40 @@ void UBlueprintGraphExportSubsystem::HandleAssetRemoved(const FAssetData& AssetD
 	FString RemovedMarkdownPath;
 	FString RemovedJsonPath;
 	FString Error;
-	UBlueprintGraphExportLibrary::RemoveAssetDocumentationBundle(
+	if (!UBlueprintGraphExportLibrary::RemoveAssetDocumentationBundle(
 		PackagePath,
 		BlueprintGraphExportSubsystem::ResolveDirectorySetting(Settings->DocumentationRootDir, BlueprintGraphExportSubsystem::GetDefaultDocumentationRootDir()),
 		BlueprintGraphExportSubsystem::ResolveDirectorySetting(Settings->JsonOutputDir, BlueprintGraphExportSubsystem::GetDefaultJsonOutputDir()),
 		RemovedMarkdownPath,
 		RemovedJsonPath,
 		Error
-	);
-
-	if (!Error.IsEmpty())
+	))
 	{
-		UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("%s"), *Error);
+		if (!Error.IsEmpty())
+		{
+			UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("%s"), *Error);
+		}
+		return;
 	}
 
-	RebuildIndex();
+	FString IndexPath;
+	FString IndexError;
+	if (!RebuildIndex(IndexPath, IndexError))
+	{
+		if (!IndexError.IsEmpty())
+		{
+			UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("%s"), *IndexError);
+		}
+		return;
+	}
+
+	FString ManifestPath;
+	int32 SupportedAssetCount = 0;
+	FString ManifestError;
+	if (!RefreshStartupSyncManifest(ManifestPath, SupportedAssetCount, ManifestError) && !ManifestError.IsEmpty())
+	{
+		UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("%s"), *ManifestError);
+	}
 }
 
 void UBlueprintGraphExportSubsystem::HandleAssetRenamed(const FAssetData& AssetData, const FString& OldObjectPath)
@@ -417,27 +678,37 @@ void UBlueprintGraphExportSubsystem::HandleAssetRenamed(const FAssetData& AssetD
 	const FString DocumentationRootDir = BlueprintGraphExportSubsystem::ResolveDirectorySetting(Settings->DocumentationRootDir, BlueprintGraphExportSubsystem::GetDefaultDocumentationRootDir());
 	const FString JsonOutputDir = BlueprintGraphExportSubsystem::ResolveDirectorySetting(Settings->JsonOutputDir, BlueprintGraphExportSubsystem::GetDefaultJsonOutputDir());
 	const FString OldPackagePath = FPackageName::ObjectPathToPackageName(OldObjectPath);
-	if (IsManagedPackagePath(OldPackagePath))
+	const bool bOldManaged = IsManagedPackagePath(OldPackagePath);
+	const bool bNewManaged = IsManagedPackagePath(AssetData.PackageName.ToString());
+	if (!bOldManaged && !bNewManaged)
+	{
+		return;
+	}
+
+	bool bSucceeded = true;
+	if (bOldManaged)
 	{
 		FString RemovedMarkdownPath;
 		FString RemovedJsonPath;
 		FString Error;
-		UBlueprintGraphExportLibrary::RemoveAssetDocumentationBundle(
+		if (!UBlueprintGraphExportLibrary::RemoveAssetDocumentationBundle(
 			OldPackagePath,
 			DocumentationRootDir,
 			JsonOutputDir,
 			RemovedMarkdownPath,
 			RemovedJsonPath,
 			Error
-		);
-
-		if (!Error.IsEmpty())
+		))
 		{
-			UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("%s"), *Error);
+			bSucceeded = false;
+			if (!Error.IsEmpty())
+			{
+				UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("%s"), *Error);
+			}
 		}
 	}
 
-	if (IsManagedPackagePath(AssetData.PackageName.ToString()))
+	if (bNewManaged)
 	{
 		if (UObject* Asset = AssetData.FastGetAsset(false))
 		{
@@ -454,15 +725,43 @@ void UBlueprintGraphExportSubsystem::HandleAssetRenamed(const FAssetData& AssetD
 				Error
 			))
 			{
+				bSucceeded = false;
 				if (!Error.IsEmpty())
 				{
 					UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("%s"), *Error);
 				}
 			}
 		}
+		else
+		{
+			bSucceeded = false;
+			UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("Failed to load renamed asset for documentation export: %s"), *AssetData.PackageName.ToString());
+		}
 	}
 
-	RebuildIndex();
+	if (!bSucceeded)
+	{
+		return;
+	}
+
+	FString IndexPath;
+	FString IndexError;
+	if (!RebuildIndex(IndexPath, IndexError))
+	{
+		if (!IndexError.IsEmpty())
+		{
+			UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("%s"), *IndexError);
+		}
+		return;
+	}
+
+	FString ManifestPath;
+	int32 SupportedAssetCount = 0;
+	FString ManifestError;
+	if (!RefreshStartupSyncManifest(ManifestPath, SupportedAssetCount, ManifestError) && !ManifestError.IsEmpty())
+	{
+		UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("%s"), *ManifestError);
+	}
 }
 
 void UBlueprintGraphExportSubsystem::HandleAssetRegistryFilesLoaded()
@@ -490,23 +789,25 @@ bool UBlueprintGraphExportSubsystem::HandleStartupSyncTicker(float DeltaTime)
 		return false;
 	}
 
-	FString Reason;
-	int32 SupportedAssetCount = 0;
-	const bool bShouldRun = ShouldRunStartupFullSync(Reason, SupportedAssetCount);
-	if (!bShouldRun)
+	bStartupSyncInProgress = true;
+	FBlueprintGraphExportSyncOptions Options = FBlueprintGraphExportSyncRunner::MakeOptionsFromSettings(Settings);
+	Options.bOnlyIfStale = Settings->bOnlyRunStartupSyncWhenStale;
+	const FBlueprintGraphExportSyncResult Result = FBlueprintGraphExportSyncRunner::RunFullSync(Options);
+	bStartupSyncInProgress = false;
+
+	if (Result.Status == EBlueprintGraphExportSyncStatus::SkippedUpToDate)
 	{
-		UE_LOG(LogBlueprintGraphExportSubsystem, Display, TEXT("Startup documentation sync skipped: %s"), *Reason);
+		UE_LOG(LogBlueprintGraphExportSubsystem, Display, TEXT("Startup documentation sync skipped: %s"), *Result.Reason);
 		return false;
 	}
 
-	UE_LOG(LogBlueprintGraphExportSubsystem, Display, TEXT("Startup documentation sync started for %d supported assets: %s"), SupportedAssetCount, *Reason);
-	bStartupSyncInProgress = true;
-	const bool bSucceeded = RunStartupFullSync(SupportedAssetCount);
-	bStartupSyncInProgress = false;
-
-	if (bSucceeded)
+	if (Result.Status == EBlueprintGraphExportSyncStatus::Success)
 	{
-		UE_LOG(LogBlueprintGraphExportSubsystem, Display, TEXT("Startup documentation sync completed for %d supported assets."), SupportedAssetCount);
+		UE_LOG(LogBlueprintGraphExportSubsystem, Display, TEXT("Startup documentation sync completed for %d supported assets."), Result.SupportedAssetCount);
+	}
+	else if (!Result.Reason.IsEmpty())
+	{
+		UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("Startup documentation sync completed with errors: %s"), *Result.Reason);
 	}
 	else
 	{
@@ -516,23 +817,26 @@ bool UBlueprintGraphExportSubsystem::HandleStartupSyncTicker(float DeltaTime)
 	return false;
 }
 
-void UBlueprintGraphExportSubsystem::ExportManagedAssetsInPackage(UPackage* Package)
+bool UBlueprintGraphExportSubsystem::ExportManagedAssetsInPackage(UPackage* Package, FString& OutError)
 {
+	OutError.Reset();
 	const UBlueprintGraphExportSettings* Settings = GetDefault<UBlueprintGraphExportSettings>();
 	if (!Settings || !Package)
 	{
-		return;
+		OutError = TEXT("BlueprintGraphExport settings or package was unavailable for incremental export.");
+		return false;
 	}
 
 	TArray<UObject*> PackageObjects;
 	GetObjectsWithPackage(Package, PackageObjects, false);
 
-	const FString DocumentationRootDir = BlueprintGraphExportSubsystem::ResolveDirectorySetting(Settings->DocumentationRootDir, BlueprintGraphExportSubsystem::GetDefaultDocumentationRootDir());
-	const FString JsonOutputDir = BlueprintGraphExportSubsystem::ResolveDirectorySetting(Settings->JsonOutputDir, BlueprintGraphExportSubsystem::GetDefaultJsonOutputDir());
+	const FBlueprintGraphExportSyncOptions Options = FBlueprintGraphExportSyncRunner::MakeOptionsFromSettings(Settings);
 
+	bool bSucceeded = true;
+	FString FirstError;
 	for (UObject* Object : PackageObjects)
 	{
-		if (!Object || Object->GetOuter() != Package)
+		if (!Object || Object->GetOuter() != Package || (!Cast<UBlueprint>(Object) && !Cast<UDataAsset>(Object)))
 		{
 			continue;
 		}
@@ -542,43 +846,74 @@ void UBlueprintGraphExportSubsystem::ExportManagedAssetsInPackage(UPackage* Pack
 		FString Error;
 		if (!UBlueprintGraphExportLibrary::ExportAssetDocumentationBundle(
 			Object,
-			DocumentationRootDir,
-			JsonOutputDir,
-			Settings->bPrettyPrintJson,
+			Options.DocumentationRootDir,
+			Options.JsonOutputDir,
+			Options.bPrettyPrintJson,
 			MarkdownPath,
 			JsonPath,
 			Error
 		))
 		{
+			bSucceeded = false;
 			if (!Error.IsEmpty())
 			{
-				UE_LOG(LogBlueprintGraphExportSubsystem, Verbose, TEXT("%s"), *Error);
+				UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("%s"), *Error);
+				if (FirstError.IsEmpty())
+				{
+					FirstError = Error;
+				}
 			}
 		}
 	}
+
+	if (!bSucceeded)
+	{
+		OutError = FirstError.IsEmpty()
+			? FString::Printf(TEXT("One or more assets in package %s failed to export."), *Package->GetName())
+			: FirstError;
+	}
+	return bSucceeded;
 }
 
-void UBlueprintGraphExportSubsystem::RebuildIndex() const
+bool UBlueprintGraphExportSubsystem::RebuildIndex(FString& OutIndexPath, FString& OutError) const
 {
+	OutIndexPath.Reset();
+	OutError.Reset();
 	const UBlueprintGraphExportSettings* Settings = GetDefault<UBlueprintGraphExportSettings>();
 	if (!Settings)
 	{
-		return;
+		OutError = TEXT("BlueprintGraphExport settings were unavailable for index rebuild.");
+		return false;
 	}
 
-	FString IndexPath;
-	FString Error;
-	if (!UBlueprintGraphExportLibrary::RebuildDocumentationIndex(
-		BlueprintGraphExportSubsystem::ResolveDirectorySetting(Settings->DocumentationRootDir, BlueprintGraphExportSubsystem::GetDefaultDocumentationRootDir()),
-		IndexPath,
-		Error
-	))
+	const FBlueprintGraphExportSyncOptions Options = FBlueprintGraphExportSyncRunner::MakeOptionsFromSettings(Settings);
+	return BlueprintGraphExportInternal::RebuildDocumentationIndexForRoots(
+		Options.RootAssetPaths,
+		Options.DocumentationRootDir,
+		OutIndexPath,
+		OutError
+	);
+}
+
+bool UBlueprintGraphExportSubsystem::RefreshStartupSyncManifest(FString& OutManifestPath, int32& OutSupportedAssetCount, FString& OutError) const
+{
+	OutManifestPath.Reset();
+	OutSupportedAssetCount = 0;
+	OutError.Reset();
+
+	const UBlueprintGraphExportSettings* Settings = GetDefault<UBlueprintGraphExportSettings>();
+	if (!Settings)
 	{
-		if (!Error.IsEmpty())
-		{
-			UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("%s"), *Error);
-		}
+		OutError = TEXT("BlueprintGraphExport settings were unavailable for manifest refresh.");
+		return false;
 	}
+
+	return FBlueprintGraphExportSyncRunner::RefreshManifest(
+		FBlueprintGraphExportSyncRunner::MakeOptionsFromSettings(Settings),
+		OutManifestPath,
+		OutSupportedAssetCount,
+		OutError
+	);
 }
 
 void UBlueprintGraphExportSubsystem::CancelScheduledStartupSync()
@@ -626,140 +961,20 @@ bool UBlueprintGraphExportSubsystem::ShouldRunStartupFullSync(FString& OutReason
 		return false;
 	}
 
-	const TArray<FAssetData> Assets = BlueprintGraphExportSubsystem::CollectManagedSupportedAssets(Settings->RootAssetPaths);
-	OutSupportedAssetCount = Assets.Num();
+	FBlueprintGraphExportSyncOptions Options = FBlueprintGraphExportSyncRunner::MakeOptionsFromSettings(Settings);
+	Options.bOnlyIfStale = Settings->bOnlyRunStartupSyncWhenStale;
 
-	const FString DocumentationRootDir = BlueprintGraphExportSubsystem::ResolveDirectorySetting(Settings->DocumentationRootDir, BlueprintGraphExportSubsystem::GetDefaultDocumentationRootDir());
-	const FString JsonOutputDir = BlueprintGraphExportSubsystem::ResolveDirectorySetting(Settings->JsonOutputDir, BlueprintGraphExportSubsystem::GetDefaultJsonOutputDir());
-	const FString ManifestPath = BlueprintGraphExportSubsystem::ResolveFileSetting(Settings->StartupSyncManifestPath, BlueprintGraphExportSubsystem::GetDefaultManifestPath());
-
-	if (!Settings->bOnlyRunStartupSyncWhenStale)
-	{
-		OutReason = TEXT("forced by startup sync settings");
-		return true;
-	}
-
-	if (!IFileManager::Get().FileExists(*ManifestPath))
-	{
-		OutReason = TEXT("startup sync manifest is missing");
-		return true;
-	}
-
-	if (!IFileManager::Get().FileExists(*BlueprintGraphExportSubsystem::GetIndexPath(DocumentationRootDir)))
-	{
-		OutReason = TEXT("documentation index is missing");
-		return true;
-	}
-
-	for (const FAssetData& AssetData : Assets)
-	{
-		const FString PackagePath = AssetData.PackageName.ToString();
-		if (!IFileManager::Get().FileExists(*BlueprintGraphExportSubsystem::GetMarkdownPathForAsset(PackagePath, DocumentationRootDir)) ||
-			!IFileManager::Get().FileExists(*BlueprintGraphExportSubsystem::GetJsonPathForAsset(PackagePath, JsonOutputDir)))
-		{
-			OutReason = FString::Printf(TEXT("documentation mirror is missing for %s"), *PackagePath);
-			return true;
-		}
-	}
-
-	TSharedPtr<FJsonObject> ExistingManifest;
-	if (!BlueprintGraphExportSubsystem::LoadJsonObjectFromFile(ManifestPath, ExistingManifest) || !ExistingManifest.IsValid())
-	{
-		OutReason = TEXT("startup sync manifest could not be parsed");
-		return true;
-	}
-
-	const TSharedRef<FJsonObject> CurrentSnapshot = BlueprintGraphExportSubsystem::BuildManifestSnapshot(
-		Assets,
-		Settings->RootAssetPaths,
-		DocumentationRootDir,
-		JsonOutputDir,
-		Settings->bPrettyPrintJson,
-		TEXT("")
-	);
-	ExistingManifest->SetStringField(TEXT("generated_at"), TEXT(""));
-
-	FString CurrentJson;
-	FString ExistingJson;
-	if (!BlueprintGraphExportSubsystem::SerializeJsonObject(CurrentSnapshot, CurrentJson) || !BlueprintGraphExportSubsystem::SerializeJsonObject(ExistingManifest.ToSharedRef(), ExistingJson))
-	{
-		OutReason = TEXT("startup sync manifest comparison failed");
-		return true;
-	}
-
-	if (CurrentJson != ExistingJson)
-	{
-		OutReason = TEXT("startup sync manifest differs from current asset state");
-		return true;
-	}
-
-	OutReason = TEXT("startup sync manifest is current");
-	return false;
+	const FBlueprintGraphExportSyncResult Result = FBlueprintGraphExportSyncRunner::EvaluateStaleness(Options);
+	OutReason = Result.Reason;
+	OutSupportedAssetCount = Result.SupportedAssetCount;
+	return Result.Status == EBlueprintGraphExportSyncStatus::Success;
 }
 
-bool UBlueprintGraphExportSubsystem::RunStartupFullSync(int32 SupportedAssetCount)
+bool UBlueprintGraphExportSubsystem::RunStartupFullSync()
 {
-	const UBlueprintGraphExportSettings* Settings = GetDefault<UBlueprintGraphExportSettings>();
-	if (!Settings)
-	{
-		return false;
-	}
-
-	const FString DocumentationRootDir = BlueprintGraphExportSubsystem::ResolveDirectorySetting(Settings->DocumentationRootDir, BlueprintGraphExportSubsystem::GetDefaultDocumentationRootDir());
-	const FString JsonOutputDir = BlueprintGraphExportSubsystem::ResolveDirectorySetting(Settings->JsonOutputDir, BlueprintGraphExportSubsystem::GetDefaultJsonOutputDir());
-	const FString ManifestPath = BlueprintGraphExportSubsystem::ResolveFileSetting(Settings->StartupSyncManifestPath, BlueprintGraphExportSubsystem::GetDefaultManifestPath());
-
-	bool bSucceeded = true;
-	for (const FString& RootAssetPath : Settings->RootAssetPaths)
-	{
-		FString ResolvedDir;
-		FString Error;
-		if (!UBlueprintGraphExportLibrary::ExportAssetsUnderPathToMarkdown(RootAssetPath, DocumentationRootDir, true, ResolvedDir, Error))
-		{
-			bSucceeded = false;
-			UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("Documentation sync failed for root %s: %s"), *RootAssetPath, *Error);
-		}
-	}
-
-	FString IndexPath;
-	FString IndexError;
-	if (!UBlueprintGraphExportLibrary::RebuildDocumentationIndex(DocumentationRootDir, IndexPath, IndexError))
-	{
-		bSucceeded = false;
-		UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("Documentation index rebuild failed: %s"), *IndexError);
-	}
-
-	if (!bSucceeded)
-	{
-		return false;
-	}
-
-	const TArray<FAssetData> Assets = BlueprintGraphExportSubsystem::CollectManagedSupportedAssets(Settings->RootAssetPaths);
-	const TSharedRef<FJsonObject> ManifestSnapshot = BlueprintGraphExportSubsystem::BuildManifestSnapshot(
-		Assets,
-		Settings->RootAssetPaths,
-		DocumentationRootDir,
-		JsonOutputDir,
-		Settings->bPrettyPrintJson,
-		FDateTime::UtcNow().ToIso8601()
-	);
-
-	FString ManifestJson;
-	if (!BlueprintGraphExportSubsystem::SerializeJsonObject(ManifestSnapshot, ManifestJson))
-	{
-		UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("Documentation sync completed but manifest serialization failed."));
-		return false;
-	}
-
-	FString ManifestError;
-	if (!BlueprintGraphExportSubsystem::SaveJsonText(ManifestJson, ManifestPath, ManifestError))
-	{
-		UE_LOG(LogBlueprintGraphExportSubsystem, Warning, TEXT("Documentation sync completed but manifest write failed: %s"), *ManifestError);
-		return false;
-	}
-
-	UE_LOG(LogBlueprintGraphExportSubsystem, Display, TEXT("Documentation sync manifest updated at %s for %d supported assets."), *ManifestPath, SupportedAssetCount);
-	return true;
+	return FBlueprintGraphExportSyncRunner::RunFullSync(
+		FBlueprintGraphExportSyncRunner::MakeOptionsFromSettings()
+	).Status == EBlueprintGraphExportSyncStatus::Success;
 }
 
 
