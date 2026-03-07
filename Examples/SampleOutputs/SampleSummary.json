@@ -1,0 +1,20 @@
+{
+  "status": "success",
+  "reason": "forced by sync options",
+  "documentation_root": "Saved/BlueprintGraphExport/Docs",
+  "json_root": "Saved/BlueprintGraphExport/Json",
+  "manifest_path": "Saved/BlueprintGraphExport/StartupSyncManifest.json",
+  "summary_path": "Saved/BlueprintGraphExport/BlueprintGraphExportRunSummary.json",
+  "index_path": "Saved/BlueprintGraphExport/AssetIndex.md",
+  "supported_asset_count": 1,
+  "exported_asset_count": 1,
+  "failed_asset_count": 0,
+  "orphaned_asset_count": 0,
+  "started_at_utc": "2026-03-07T00:00:00.000Z",
+  "finished_at_utc": "2026-03-07T00:00:01.200Z",
+  "duration_seconds": 1.2,
+  "roots": [
+    "/Game"
+  ],
+  "failed_assets": []
+}

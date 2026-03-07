@@ -10,6 +10,7 @@
 #include "Dom/JsonObject.h"
 #include "Engine/Blueprint.h"
 #include "Engine/DataAsset.h"
+#include "Engine/DataTable.h"
 #include "HAL/FileManager.h"
 #include "Misc/DateTime.h"
 #include "Misc/FileHelper.h"
@@ -81,7 +82,7 @@ namespace BlueprintGraphExportSubsystem
 
 	static bool IsSupportedAsset(UObject* Asset)
 	{
-		return Asset && (Cast<UBlueprint>(Asset) || Cast<UDataAsset>(Asset));
+		return Asset && (Cast<UBlueprint>(Asset) || Cast<UDataAsset>(Asset) || Cast<UDataTable>(Asset));
 	}
 
 	static TArray<FAssetData> CollectSupportedAssetsUnderRoot(
@@ -836,7 +837,7 @@ bool UBlueprintGraphExportSubsystem::ExportManagedAssetsInPackage(UPackage* Pack
 	FString FirstError;
 	for (UObject* Object : PackageObjects)
 	{
-		if (!Object || Object->GetOuter() != Package || (!Cast<UBlueprint>(Object) && !Cast<UDataAsset>(Object)))
+		if (!Object || Object->GetOuter() != Package || (!Cast<UBlueprint>(Object) && !Cast<UDataAsset>(Object) && !Cast<UDataTable>(Object)))
 		{
 			continue;
 		}

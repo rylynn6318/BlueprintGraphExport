@@ -6,17 +6,17 @@
 #include "BlueprintGraphExportLibraryInternal.h"
 #include "BlueprintGraphExportSettings.h"
 #include "BlueprintGraphExportPathUtils.h"
-#include "Containers/Map.h"
-#include "Containers/Set.h"
 #include "Dom/JsonObject.h"
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
 #include "Engine/Blueprint.h"
 #include "Engine/DataAsset.h"
+#include "Engine/DataTable.h"
 #include "HAL/FileManager.h"
 #include "K2Node.h"
 #include "Kismet2/BlueprintEditorUtils.h"
+#include "DataTableUtils.h"
 #include "Misc/DateTime.h"
 #include "Misc/EngineVersion.h"
 #include "Misc/FileHelper.h"
@@ -546,6 +546,131 @@ namespace BlueprintGraphExport
 		Targets.SetNum(Algo::Unique(Targets));
 		return Targets;
 	}
+
+	static void CollectNestedPropertyReferenceTargetsFromContainer(const FProperty* Property, const void* Container, TArray<FString>& OutTargets);
+	static void CollectNestedPropertyReferenceTargetsFromPropertyValue(const FProperty* Property, const void* PropertyValuePtr, TArray<FString>& OutTargets);
+
+	static void CollectNestedPropertyReferenceTargetsFromSingleValue(const FProperty* Property, const void* ValuePtr, TArray<FString>& OutTargets)
+	{
+		if (!Property || !ValuePtr)
+		{
+			return;
+		}
+
+		if (const FObjectPropertyBase* ObjectProperty = CastField<FObjectPropertyBase>(Property))
+		{
+			if (const UObject* ReferencedObject = ObjectProperty->GetObjectPropertyValue(ValuePtr))
+			{
+				OutTargets.Add(ReferencedObject->GetPathName());
+			}
+			return;
+		}
+
+		if (const FSoftObjectProperty* SoftObjectProperty = CastField<FSoftObjectProperty>(Property))
+		{
+			const FSoftObjectPtr SoftObjectPtr = SoftObjectProperty->GetPropertyValue(ValuePtr);
+			if (!SoftObjectPtr.ToSoftObjectPath().IsNull())
+			{
+				OutTargets.Add(SoftObjectPtr.ToSoftObjectPath().ToString());
+			}
+			return;
+		}
+
+		if (const FStructProperty* StructProperty = CastField<FStructProperty>(Property))
+		{
+			if (!StructProperty->Struct)
+			{
+				return;
+			}
+
+			for (TFieldIterator<FProperty> PropertyIterator(StructProperty->Struct, EFieldIterationFlags::IncludeSuper); PropertyIterator; ++PropertyIterator)
+			{
+				FProperty* InnerProperty = *PropertyIterator;
+				if (!InnerProperty || InnerProperty->HasAnyPropertyFlags(CPF_Transient | CPF_Deprecated))
+				{
+					continue;
+				}
+
+				CollectNestedPropertyReferenceTargetsFromContainer(InnerProperty, ValuePtr, OutTargets);
+			}
+			return;
+		}
+
+		if (const FArrayProperty* ArrayProperty = CastField<FArrayProperty>(Property))
+		{
+			FScriptArrayHelper ArrayHelper(ArrayProperty, ValuePtr);
+			for (int32 ElementIndex = 0; ElementIndex < ArrayHelper.Num(); ++ElementIndex)
+			{
+				CollectNestedPropertyReferenceTargetsFromPropertyValue(ArrayProperty->Inner, ArrayHelper.GetElementPtr(ElementIndex), OutTargets);
+			}
+			return;
+		}
+
+		if (const FSetProperty* SetProperty = CastField<FSetProperty>(Property))
+		{
+			FScriptSetHelper SetHelper(SetProperty, ValuePtr);
+			for (int32 ElementIndex = 0; ElementIndex < SetHelper.GetMaxIndex(); ++ElementIndex)
+			{
+				if (!SetHelper.IsValidIndex(ElementIndex))
+				{
+					continue;
+				}
+
+				CollectNestedPropertyReferenceTargetsFromPropertyValue(SetProperty->ElementProp, SetHelper.GetElementPtr(ElementIndex), OutTargets);
+			}
+			return;
+		}
+
+		if (const FMapProperty* MapProperty = CastField<FMapProperty>(Property))
+		{
+			FScriptMapHelper MapHelper(MapProperty, ValuePtr);
+			for (int32 ElementIndex = 0; ElementIndex < MapHelper.GetMaxIndex(); ++ElementIndex)
+			{
+				if (!MapHelper.IsValidIndex(ElementIndex))
+				{
+					continue;
+				}
+
+				CollectNestedPropertyReferenceTargetsFromPropertyValue(MapProperty->KeyProp, MapHelper.GetKeyPtr(ElementIndex), OutTargets);
+				CollectNestedPropertyReferenceTargetsFromPropertyValue(MapProperty->ValueProp, MapHelper.GetValuePtr(ElementIndex), OutTargets);
+			}
+		}
+	}
+
+	static void CollectNestedPropertyReferenceTargetsFromPropertyValue(const FProperty* Property, const void* PropertyValuePtr, TArray<FString>& OutTargets)
+	{
+		if (!Property || !PropertyValuePtr)
+		{
+			return;
+		}
+
+		const uint8* ValueBytes = static_cast<const uint8*>(PropertyValuePtr);
+		const int32 ElementSize = Property->GetElementSize();
+		for (int32 ArrayIndex = 0; ArrayIndex < Property->ArrayDim; ++ArrayIndex)
+		{
+			CollectNestedPropertyReferenceTargetsFromSingleValue(Property, ValueBytes + (static_cast<SIZE_T>(ArrayIndex) * ElementSize), OutTargets);
+		}
+	}
+
+	static void CollectNestedPropertyReferenceTargetsFromContainer(const FProperty* Property, const void* Container, TArray<FString>& OutTargets)
+	{
+		if (!Property || !Container)
+		{
+			return;
+		}
+
+		CollectNestedPropertyReferenceTargetsFromPropertyValue(Property, Property->ContainerPtrToValuePtr<void>(Container), OutTargets);
+	}
+
+	static TArray<FString> CollectNestedPropertyReferenceTargets(const FProperty* Property, const void* Container)
+	{
+		TArray<FString> Targets;
+		CollectNestedPropertyReferenceTargetsFromContainer(Property, Container, Targets);
+		Targets.Sort();
+		Targets.SetNum(Algo::Unique(Targets));
+		return Targets;
+	}
+
 	static TSharedPtr<FJsonObject> SerializeDataAsset(UDataAsset* DataAsset, const FString& AssetPath)
 	{
 		TSharedPtr<FJsonObject> AssetObject = MakeShared<FJsonObject>();
@@ -587,6 +712,68 @@ namespace BlueprintGraphExport
 		}
 
 		AssetObject->SetArrayField(TEXT("properties"), PropertyValues);
+		return AssetObject;
+	}
+
+	static TSharedPtr<FJsonObject> SerializeDataTable(UDataTable* DataTable, const FString& AssetPath)
+	{
+		TSharedPtr<FJsonObject> AssetObject = MakeShared<FJsonObject>();
+		AssetObject->SetStringField(TEXT("asset_kind"), TEXT("data_table"));
+		AssetObject->SetStringField(TEXT("asset_path"), AssetPath);
+		AssetObject->SetStringField(TEXT("asset_name"), DataTable ? DataTable->GetName() : FString());
+		AssetObject->SetStringField(TEXT("asset_class"), DataTable ? DataTable->GetClass()->GetPathName() : FString());
+		AssetObject->SetStringField(TEXT("row_struct_path"), (DataTable && DataTable->GetRowStruct()) ? DataTable->GetRowStruct()->GetPathName() : FString());
+		AssetObject->SetStringField(TEXT("row_struct_name"), (DataTable && DataTable->GetRowStruct()) ? DataTable->GetRowStruct()->GetName() : FString());
+		AssetObject->SetArrayField(TEXT("dependencies"), ToJsonStringArray(CollectDependencies(FName(*AssetPath))));
+
+		TArray<TSharedPtr<FJsonValue>> RowValues;
+		if (DataTable && DataTable->GetRowStruct())
+		{
+			const TMap<FName, uint8*>& RowMap = DataTable->GetRowMap();
+			TArray<FName> RowNames;
+			RowMap.GenerateKeyArray(RowNames);
+			RowNames.Sort([](const FName& Left, const FName& Right)
+			{
+				return Left.ToString() < Right.ToString();
+			});
+
+			for (const FName& RowName : RowNames)
+			{
+				const uint8* const* RowData = RowMap.Find(RowName);
+				if (!RowData || !*RowData)
+				{
+					continue;
+				}
+
+				TSharedPtr<FJsonObject> RowObject = MakeShared<FJsonObject>();
+				RowObject->SetStringField(TEXT("row_name"), RowName.ToString());
+
+				TArray<TSharedPtr<FJsonValue>> ColumnValues;
+				for (TFieldIterator<FProperty> PropertyIterator(DataTable->GetRowStruct(), EFieldIterationFlags::IncludeSuper); PropertyIterator; ++PropertyIterator)
+				{
+					FProperty* Property = *PropertyIterator;
+					if (!Property || Property->HasAnyPropertyFlags(CPF_Transient | CPF_Deprecated))
+					{
+						continue;
+					}
+
+					TSharedPtr<FJsonObject> ColumnObject = MakeShared<FJsonObject>();
+					ColumnObject->SetStringField(TEXT("column_name"), DataTableUtils::GetPropertyExportName(Property));
+					ColumnObject->SetStringField(TEXT("property_name"), Property->GetName());
+					ColumnObject->SetStringField(TEXT("property_type"), Property->GetCPPType());
+					ColumnObject->SetStringField(TEXT("property_class"), Property->GetClass()->GetName());
+					ColumnObject->SetStringField(TEXT("value_text"), DataTableUtils::GetPropertyValueAsString(Property, *RowData, EDataTableExportFlags::None));
+					ColumnObject->SetArrayField(TEXT("reference_targets"), ToJsonStringArray(CollectNestedPropertyReferenceTargets(Property, *RowData)));
+					ColumnValues.Add(MakeShared<FJsonValueObject>(ColumnObject));
+				}
+
+				RowObject->SetArrayField(TEXT("columns"), ColumnValues);
+				RowValues.Add(MakeShared<FJsonValueObject>(RowObject));
+			}
+		}
+
+		AssetObject->SetArrayField(TEXT("rows"), RowValues);
+		AssetObject->SetNumberField(TEXT("row_count"), RowValues.Num());
 		return AssetObject;
 	}
 
@@ -632,9 +819,9 @@ namespace BlueprintGraphExport
 			return false;
 		}
 
-		if (!Cast<UBlueprint>(Asset) && !Cast<UDataAsset>(Asset))
+		if (!Cast<UBlueprint>(Asset) && !Cast<UDataAsset>(Asset) && !Cast<UDataTable>(Asset))
 		{
-			OutError = TEXT("Input asset is not a supported Blueprint or DataAsset.");
+			OutError = TEXT("Input asset is not a supported Blueprint, DataAsset, or DataTable.");
 			return false;
 		}
 
@@ -674,6 +861,10 @@ namespace BlueprintGraphExport
 		if (UDataAsset* DataAsset = Cast<UDataAsset>(Asset))
 		{
 			return SerializeDataAsset(DataAsset, AssetPath);
+		}
+		if (UDataTable* DataTable = Cast<UDataTable>(Asset))
+		{
+			return SerializeDataTable(DataTable, AssetPath);
 		}
 		return nullptr;
 	}
@@ -740,229 +931,11 @@ namespace BlueprintGraphExport
 		Lines.Add(FString::Printf(TEXT("- %s: %s"), *Label, *JoinAsBacktickList(Values)));
 	}
 
-	static FString GetShortNameFromPath(const FString& ObjectPath)
-	{
-		int32 SeparatorIndex = INDEX_NONE;
-		if (ObjectPath.FindLastChar(TEXT('.'), SeparatorIndex))
-		{
-			return ObjectPath.Mid(SeparatorIndex + 1);
-		}
-		if (ObjectPath.FindLastChar(TEXT('/'), SeparatorIndex))
-		{
-			return ObjectPath.Mid(SeparatorIndex + 1);
-		}
-		return ObjectPath;
-	}
-
-	static FString EscapeMermaidLabel(const FString& Text)
-	{
-		FString Escaped = NormalizeMultilineForMarkdown(Text);
-		Escaped.ReplaceInline(TEXT("&"), TEXT("&amp;"));
-		Escaped.ReplaceInline(TEXT("<"), TEXT("&lt;"));
-		Escaped.ReplaceInline(TEXT(">"), TEXT("&gt;"));
-		Escaped.ReplaceInline(TEXT("\""), TEXT("&quot;"));
-		Escaped.ReplaceInline(TEXT("\\"), TEXT("&#92;"));
-		Escaped.ReplaceInline(TEXT("\n"), TEXT("<br/>"));
-		return Escaped;
-	}
-
-	static FString MakeMermaidSafeNodeId(const FString& NodeGuid, const int32 FallbackIndex)
-	{
-		const FString Source = NodeGuid.IsEmpty()
-			? FString::Printf(TEXT("Node_%03d"), FallbackIndex)
-			: NodeGuid;
-
-		FString Sanitized;
-		Sanitized.Reserve(Source.Len());
-		for (const TCHAR Character : Source)
-		{
-			Sanitized.AppendChar(FChar::IsAlnum(Character) ? Character : TEXT('_'));
-		}
-
-		return FString::Printf(TEXT("N_%s"), *Sanitized);
-	}
-
-	static FString GetMermaidNodeLabel(const TSharedPtr<FJsonObject>& NodeObject, const int32 FallbackIndex)
-	{
-		if (!NodeObject.IsValid())
-		{
-			return FString::Printf(TEXT("Node %03d"), FallbackIndex);
-		}
-
-		const FString NodeTitle = NodeObject->GetStringField(TEXT("node_title"));
-		if (!NodeTitle.IsEmpty())
-		{
-			return NodeTitle;
-		}
-
-		const FString ShortClassName = GetShortNameFromPath(NodeObject->GetStringField(TEXT("node_class")));
-		if (!ShortClassName.IsEmpty())
-		{
-			return ShortClassName;
-		}
-
-		return FString::Printf(TEXT("Node %03d"), FallbackIndex);
-	}
-
-	static bool BuildGraphMermaidFlowchart(
-		const TSharedPtr<FJsonObject>& GraphObject,
-		const int32 MaxNodeCount,
-		FString& OutMermaid,
-		FString& OutReason
-	)
-	{
-		OutMermaid.Reset();
-		OutReason.Reset();
-
-		if (!GraphObject.IsValid())
-		{
-			OutReason = TEXT("Visualization unavailable for this graph.");
-			return false;
-		}
-
-		const TArray<TSharedPtr<FJsonValue>>* NodeValues = nullptr;
-		if (!GraphObject->TryGetArrayField(TEXT("nodes"), NodeValues) || !NodeValues)
-		{
-			OutReason = TEXT("Visualization unavailable for this graph.");
-			return false;
-		}
-
-		if (NodeValues->Num() <= 0)
-		{
-			OutReason = TEXT("Visualization skipped: graph has no nodes.");
-			return false;
-		}
-
-		if (NodeValues->Num() > MaxNodeCount)
-		{
-			OutReason = FString::Printf(
-				TEXT("Visualization skipped: graph has %d nodes, which exceeds the configured limit of %d."),
-				NodeValues->Num(),
-				MaxNodeCount
-			);
-			return false;
-		}
-
-		TMap<FString, FString> GuidToNodeId;
-		TArray<FString> NodeLines;
-		NodeLines.Reserve(NodeValues->Num());
-
-		int32 NodeIndex = 0;
-		for (const TSharedPtr<FJsonValue>& NodeValue : *NodeValues)
-		{
-			++NodeIndex;
-			const TSharedPtr<FJsonObject> NodeObject = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
-			if (!NodeObject.IsValid())
-			{
-				continue;
-			}
-
-			const FString NodeGuid = NodeObject->GetStringField(TEXT("node_guid"));
-			const FString NodeId = MakeMermaidSafeNodeId(NodeGuid, NodeIndex);
-			const FString NodeLabel = EscapeMermaidLabel(GetMermaidNodeLabel(NodeObject, NodeIndex));
-
-			NodeLines.Add(FString::Printf(TEXT("    %s[\"%s\"]"), *NodeId, *NodeLabel));
-			if (!NodeGuid.IsEmpty())
-			{
-				GuidToNodeId.Add(NodeGuid, NodeId);
-			}
-		}
-
-		if (NodeLines.IsEmpty())
-		{
-			OutReason = TEXT("Visualization unavailable for this graph.");
-			return false;
-		}
-
-		TSet<FString> UniqueEdges;
-		TArray<FString> EdgeLines;
-		NodeIndex = 0;
-		for (const TSharedPtr<FJsonValue>& NodeValue : *NodeValues)
-		{
-			++NodeIndex;
-			const TSharedPtr<FJsonObject> NodeObject = NodeValue.IsValid() ? NodeValue->AsObject() : nullptr;
-			if (!NodeObject.IsValid())
-			{
-				continue;
-			}
-
-			const FString SourceGuid = NodeObject->GetStringField(TEXT("node_guid"));
-			const FString* SourceNodeId = GuidToNodeId.Find(SourceGuid);
-			if (!SourceNodeId)
-			{
-				continue;
-			}
-
-			const TArray<TSharedPtr<FJsonValue>>* PinValues = nullptr;
-			if (!NodeObject->TryGetArrayField(TEXT("pins"), PinValues) || !PinValues)
-			{
-				continue;
-			}
-
-			for (const TSharedPtr<FJsonValue>& PinValue : *PinValues)
-			{
-				const TSharedPtr<FJsonObject> PinObject = PinValue.IsValid() ? PinValue->AsObject() : nullptr;
-				if (!PinObject.IsValid())
-				{
-					continue;
-				}
-
-				const TArray<TSharedPtr<FJsonValue>>* LinkedToValues = nullptr;
-				if (!PinObject->TryGetArrayField(TEXT("linked_to"), LinkedToValues) || !LinkedToValues)
-				{
-					continue;
-				}
-
-				for (const TSharedPtr<FJsonValue>& LinkValue : *LinkedToValues)
-				{
-					const TSharedPtr<FJsonObject> LinkObject = LinkValue.IsValid() ? LinkValue->AsObject() : nullptr;
-					if (!LinkObject.IsValid())
-					{
-						continue;
-					}
-
-					FString TargetGuid;
-					if (!LinkObject->TryGetStringField(TEXT("target_node_guid"), TargetGuid) || TargetGuid.IsEmpty())
-					{
-						continue;
-					}
-
-					const FString* TargetNodeId = GuidToNodeId.Find(TargetGuid);
-					if (!TargetNodeId)
-					{
-						continue;
-					}
-
-					const FString EdgeKey = FString::Printf(TEXT("%s-->%s"), **SourceNodeId, **TargetNodeId);
-					if (UniqueEdges.Contains(EdgeKey))
-					{
-						continue;
-					}
-
-					UniqueEdges.Add(EdgeKey);
-					EdgeLines.Add(FString::Printf(TEXT("    %s --> %s"), **SourceNodeId, **TargetNodeId));
-				}
-			}
-		}
-
-		TArray<FString> MermaidLines;
-		MermaidLines.Reserve(1 + NodeLines.Num() + EdgeLines.Num());
-		MermaidLines.Add(TEXT("flowchart LR"));
-		MermaidLines.Append(NodeLines);
-		MermaidLines.Append(EdgeLines);
-
-		OutMermaid = FString::Join(MermaidLines, TEXT("\n"));
-		return true;
-	}
-
 	static FString BuildBlueprintMarkdown(const TSharedPtr<FJsonObject>& AssetObject)
 	{
 		const FString AssetPath = AssetObject->GetStringField(TEXT("asset_path"));
 		const TArray<TSharedPtr<FJsonValue>>* GraphValues = nullptr;
 		AssetObject->TryGetArrayField(TEXT("graphs"), GraphValues);
-		const UBlueprintGraphExportSettings* Settings = GetDefault<UBlueprintGraphExportSettings>();
-		const bool bIncludeVisualization = Settings ? Settings->bIncludeGraphVisualizationInMarkdown : true;
-		const int32 MaxVisualizationNodeCount = (Settings && Settings->MaxVisualizationNodeCount > 0) ? Settings->MaxVisualizationNodeCount : 80;
 
 		TArray<FString> Lines;
 		Lines.Add(FString::Printf(TEXT("# `%s`"), *EscapeMarkdown(AssetPath)));
@@ -1012,26 +985,6 @@ namespace BlueprintGraphExport
 				Lines.Add(FString::Printf(TEXT("- schema_class: `%s`"), *EscapeMarkdown(GraphObject->GetStringField(TEXT("schema_class")))));
 				Lines.Add(FString::Printf(TEXT("- node_count: `%d`"), static_cast<int32>(GraphObject->GetNumberField(TEXT("node_count")))));
 				Lines.Add(TEXT(""));
-
-				if (bIncludeVisualization)
-				{
-					Lines.Add(TEXT("#### Visualization"));
-					Lines.Add(TEXT(""));
-
-					FString MermaidGraph;
-					FString VisualizationReason;
-					if (BuildGraphMermaidFlowchart(GraphObject, MaxVisualizationNodeCount, MermaidGraph, VisualizationReason))
-					{
-						Lines.Add(TEXT("```mermaid"));
-						Lines.Add(MermaidGraph);
-						Lines.Add(TEXT("```"));
-					}
-					else
-					{
-						Lines.Add(VisualizationReason.IsEmpty() ? TEXT("Visualization unavailable for this graph.") : VisualizationReason);
-					}
-					Lines.Add(TEXT(""));
-				}
 
 				const TArray<TSharedPtr<FJsonValue>>* NodeValues = nullptr;
 				if (GraphObject->TryGetArrayField(TEXT("nodes"), NodeValues) && NodeValues)
@@ -1166,6 +1119,81 @@ namespace BlueprintGraphExport
 		return FString::Join(Lines, TEXT("\n")) + TEXT("\n");
 	}
 
+	static FString BuildDataTableMarkdown(const TSharedPtr<FJsonObject>& AssetObject)
+	{
+		const FString AssetPath = AssetObject->GetStringField(TEXT("asset_path"));
+		TArray<FString> Lines;
+		Lines.Add(FString::Printf(TEXT("# `%s`"), *EscapeMarkdown(AssetPath)));
+		Lines.Add(TEXT(""));
+		Lines.Add(TEXT("## Metadata"));
+		Lines.Add(TEXT(""));
+		Lines.Add(TEXT("- asset_kind: `data_table`"));
+		Lines.Add(FString::Printf(TEXT("- asset_name: `%s`"), *EscapeMarkdown(AssetObject->GetStringField(TEXT("asset_name")))));
+		Lines.Add(FString::Printf(TEXT("- asset_class: `%s`"), *EscapeMarkdown(AssetObject->GetStringField(TEXT("asset_class")))));
+		Lines.Add(FString::Printf(TEXT("- row_struct_path: `%s`"), *EscapeMarkdown(AssetObject->GetStringField(TEXT("row_struct_path")))));
+		Lines.Add(FString::Printf(TEXT("- row_count: `%d`"), static_cast<int32>(AssetObject->GetNumberField(TEXT("row_count")))));
+		AppendStringListSection(Lines, TEXT("dependencies"), GetStringArray(AssetObject, TEXT("dependencies")));
+		Lines.Add(TEXT(""));
+		Lines.Add(TEXT("## Rows"));
+		Lines.Add(TEXT(""));
+
+		const TArray<TSharedPtr<FJsonValue>>* RowValues = nullptr;
+		if (AssetObject->TryGetArrayField(TEXT("rows"), RowValues) && RowValues && RowValues->Num() > 0)
+		{
+			for (const TSharedPtr<FJsonValue>& RowValue : *RowValues)
+			{
+				const TSharedPtr<FJsonObject> RowObject = RowValue->AsObject();
+				if (!RowObject.IsValid())
+				{
+					continue;
+				}
+
+				Lines.Add(FString::Printf(TEXT("### `%s`"), *EscapeMarkdown(RowObject->GetStringField(TEXT("row_name")))));
+				Lines.Add(TEXT(""));
+
+				const TArray<TSharedPtr<FJsonValue>>* ColumnValues = nullptr;
+				if (RowObject->TryGetArrayField(TEXT("columns"), ColumnValues) && ColumnValues && ColumnValues->Num() > 0)
+				{
+					Lines.Add(FString::Printf(TEXT("- column_count: `%d`"), ColumnValues->Num()));
+					Lines.Add(TEXT("- values:"));
+					for (const TSharedPtr<FJsonValue>& ColumnValue : *ColumnValues)
+					{
+						const TSharedPtr<FJsonObject> ColumnObject = ColumnValue->AsObject();
+						if (!ColumnObject.IsValid())
+						{
+							continue;
+						}
+
+						const FString ValueText = NormalizeMultilineForMarkdown(ColumnObject->GetStringField(TEXT("value_text"))).Replace(TEXT("\n"), TEXT("<br>"));
+						Lines.Add(FString::Printf(
+							TEXT("  - `%s` (`%s`): %s"),
+							*EscapeMarkdown(ColumnObject->GetStringField(TEXT("column_name"))),
+							*EscapeMarkdown(ColumnObject->GetStringField(TEXT("property_type"))),
+							ValueText.IsEmpty() ? TEXT("<empty>") : *EscapeMarkdown(ValueText)
+						));
+						Lines.Add(FString::Printf(
+							TEXT("    - reference_targets: %s"),
+							*JoinAsBacktickList(GetStringArray(ColumnObject, TEXT("reference_targets")))
+						));
+					}
+				}
+				else
+				{
+					Lines.Add(TEXT("No columns were exported for this row."));
+				}
+
+				Lines.Add(TEXT(""));
+			}
+		}
+		else
+		{
+			Lines.Add(TEXT("No rows were exported."));
+			Lines.Add(TEXT(""));
+		}
+
+		return FString::Join(Lines, TEXT("\n")) + TEXT("\n");
+	}
+
 	static FString BuildAssetMarkdown(const TSharedPtr<FJsonObject>& AssetObject)
 	{
 		if (!AssetObject.IsValid())
@@ -1173,9 +1201,16 @@ namespace BlueprintGraphExport
 			return FString();
 		}
 
-		return AssetObject->GetStringField(TEXT("asset_kind")) == TEXT("data_asset")
-			? BuildDataAssetMarkdown(AssetObject)
-			: BuildBlueprintMarkdown(AssetObject);
+		const FString AssetKind = AssetObject->GetStringField(TEXT("asset_kind"));
+		if (AssetKind == TEXT("data_asset"))
+		{
+			return BuildDataAssetMarkdown(AssetObject);
+		}
+		if (AssetKind == TEXT("data_table"))
+		{
+			return BuildDataTableMarkdown(AssetObject);
+		}
+		return BuildBlueprintMarkdown(AssetObject);
 	}
 
 	static bool IsValidRootAssetPath(const FString& RootAssetPath, FString& OutError)
@@ -1211,7 +1246,7 @@ namespace BlueprintGraphExport
 		{
 			if (UObject* Asset = AssetData.GetAsset())
 			{
-				if (Cast<UBlueprint>(Asset) || Cast<UDataAsset>(Asset))
+				if (Cast<UBlueprint>(Asset) || Cast<UDataAsset>(Asset) || Cast<UDataTable>(Asset))
 				{
 					SupportedAssets.Add(AssetData);
 				}
@@ -1360,16 +1395,27 @@ namespace BlueprintGraphExport
 			const FString LinkPath = FString::Printf(TEXT("%s/%s"), *RootFolderName, *GetRelativeMirrorPath(AssetPath, TEXT(".md")));
 			Lines.Add(FString::Printf(TEXT("## [`%s`](%s)"), *EscapeMarkdown(AssetPath), *LinkPath.Replace(TEXT("\\"), TEXT("/"))));
 			Lines.Add(TEXT(""));
-			Lines.Add(FString::Printf(TEXT("- asset_kind: `%s`"), *EscapeMarkdown(AssetObject->GetStringField(TEXT("asset_kind")))));
+			const FString AssetKind = AssetObject->GetStringField(TEXT("asset_kind"));
+			Lines.Add(FString::Printf(TEXT("- asset_kind: `%s`"), *EscapeMarkdown(AssetKind)));
 			Lines.Add(FString::Printf(TEXT("- asset_class: `%s`"), *EscapeMarkdown(AssetObject->GetStringField(TEXT("asset_class")))));
-			Lines.Add(FString::Printf(TEXT("- parent_class_path: `%s`"), *EscapeMarkdown(AssetObject->GetStringField(TEXT("parent_class_path")))));
+			if (AssetKind != TEXT("data_table"))
+			{
+				FString ParentClassPath;
+				AssetObject->TryGetStringField(TEXT("parent_class_path"), ParentClassPath);
+				Lines.Add(FString::Printf(TEXT("- parent_class_path: `%s`"), *EscapeMarkdown(ParentClassPath)));
+			}
 			AppendStringListSection(Lines, TEXT("dependencies"), GetStringArray(AssetObject, TEXT("dependencies")));
-			if (AssetObject->GetStringField(TEXT("asset_kind")) == TEXT("blueprint"))
+			if (AssetKind == TEXT("blueprint"))
 			{
 				AppendStringListSection(Lines, TEXT("implemented_interfaces"), GetStringArray(AssetObject, TEXT("implemented_interfaces")));
 				const TArray<TSharedPtr<FJsonValue>>* Graphs = nullptr;
 				AssetObject->TryGetArrayField(TEXT("graphs"), Graphs);
 				Lines.Add(FString::Printf(TEXT("- graph_count: `%d`"), Graphs ? Graphs->Num() : 0));
+			}
+			else if (AssetKind == TEXT("data_table"))
+			{
+				Lines.Add(FString::Printf(TEXT("- row_struct_path: `%s`"), *EscapeMarkdown(AssetObject->GetStringField(TEXT("row_struct_path")))));
+				Lines.Add(FString::Printf(TEXT("- row_count: `%d`"), static_cast<int32>(AssetObject->GetNumberField(TEXT("row_count")))));
 			}
 			else
 			{

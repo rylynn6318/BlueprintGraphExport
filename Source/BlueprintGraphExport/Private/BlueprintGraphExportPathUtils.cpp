@@ -50,23 +50,23 @@ namespace BlueprintGraphExportPathUtils
 	FString GetDocumentationRootDir(const UBlueprintGraphExportSettings* Settings)
 	{
 		const UBlueprintGraphExportSettings* EffectiveSettings = Settings ? Settings : GetDefault<UBlueprintGraphExportSettings>();
-		return ResolveConfiguredPath(EffectiveSettings ? EffectiveSettings->DocumentationRootDir : FString(), TEXT("Docs/AssetMirror"), EffectiveSettings);
+		return ResolveConfiguredPath(EffectiveSettings ? EffectiveSettings->DocumentationRootDir : FString(), TEXT("Saved/BlueprintGraphExport/Docs"), EffectiveSettings);
 	}
 
 	FString GetJsonOutputDir(const UBlueprintGraphExportSettings* Settings)
 	{
 		const UBlueprintGraphExportSettings* EffectiveSettings = Settings ? Settings : GetDefault<UBlueprintGraphExportSettings>();
-		return ResolveConfiguredPath(EffectiveSettings ? EffectiveSettings->JsonOutputDir : FString(), TEXT("Saved/BlueprintGraphAnalysis"), EffectiveSettings);
+		return ResolveConfiguredPath(EffectiveSettings ? EffectiveSettings->JsonOutputDir : FString(), TEXT("Saved/BlueprintGraphExport/Json"), EffectiveSettings);
 	}
 
 	FString GetManifestPath(const UBlueprintGraphExportSettings* Settings)
 	{
 		const UBlueprintGraphExportSettings* EffectiveSettings = Settings ? Settings : GetDefault<UBlueprintGraphExportSettings>();
-		return ResolveConfiguredPath(EffectiveSettings ? EffectiveSettings->StartupSyncManifestPath : FString(), TEXT("Saved/BlueprintGraphAnalysis/StartupSyncManifest.json"), EffectiveSettings);
+		return ResolveConfiguredPath(EffectiveSettings ? EffectiveSettings->StartupSyncManifestPath : FString(), TEXT("Saved/BlueprintGraphExport/StartupSyncManifest.json"), EffectiveSettings);
 	}
 
 	FString GetAggregateOutputPath(const UBlueprintGraphExportSettings* Settings)
 	{
-		return ResolveConfiguredPath(FString(), TEXT("Saved/BlueprintGraphAnalysis.json"), Settings ? Settings : GetDefault<UBlueprintGraphExportSettings>());
+		return ResolveConfiguredPath(FString(), TEXT("Saved/BlueprintGraphExport/BlueprintGraphAnalysis.json"), Settings ? Settings : GetDefault<UBlueprintGraphExportSettings>());
 	}
 }

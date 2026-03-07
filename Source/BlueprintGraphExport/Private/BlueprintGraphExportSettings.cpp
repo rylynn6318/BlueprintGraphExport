@@ -4,15 +4,13 @@ UBlueprintGraphExportSettings::UBlueprintGraphExportSettings()
 {
 	bEnableAutoExportOnSave = true;
 	bPrettyPrintJson = true;
-	bIncludeGraphVisualizationInMarkdown = true;
-	MaxVisualizationNodeCount = 80;
-	bEnableStartupFullSync = true;
+	bEnableStartupFullSync = false;
 	bOnlyRunStartupSyncWhenStale = true;
 	StartupSyncDelaySeconds = 0.0f;
 	OutputBaseDir = TEXT(".");
-	StartupSyncManifestPath = TEXT("Saved/BlueprintGraphAnalysis/StartupSyncManifest.json");
-	DocumentationRootDir = TEXT("Docs/AssetMirror");
-	JsonOutputDir = TEXT("Saved/BlueprintGraphAnalysis");
+	StartupSyncManifestPath = TEXT("Saved/BlueprintGraphExport/StartupSyncManifest.json");
+	DocumentationRootDir = TEXT("Saved/BlueprintGraphExport/Docs");
+	JsonOutputDir = TEXT("Saved/BlueprintGraphExport/Json");
 	RootAssetPaths = { TEXT("/Game") };
 
 	CategoryName = TEXT("Plugins");
@@ -35,7 +33,7 @@ FText UBlueprintGraphExportSettings::GetSectionDescription() const
 	return NSLOCTEXT(
 		"BlueprintGraphExport",
 		"SettingsSectionDescription",
-		"Controls automatic Blueprint and DataAsset markdown or JSON exports, including optional Mermaid graph visualizations. Relative output paths are resolved against the configured output base directory, which defaults to the project directory."
+		"Controls automatic Blueprint, DataAsset, and DataTable markdown or JSON exports. Save-triggered export is enabled by default, while startup full sync is optional because it can be expensive on large projects. Relative output paths are resolved against the configured output base directory, which defaults to the project directory."
 	);
 }
 #endif

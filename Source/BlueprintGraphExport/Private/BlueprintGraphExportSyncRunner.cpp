@@ -12,6 +12,7 @@
 #include "Dom/JsonObject.h"
 #include "Engine/Blueprint.h"
 #include "Engine/DataAsset.h"
+#include "Engine/DataTable.h"
 #include "HAL/FileManager.h"
 #include "Misc/FileHelper.h"
 #include "Misc/PackageName.h"
@@ -26,7 +27,7 @@ namespace BlueprintGraphExportSyncRunnerPrivate
 	static FString GetDefaultSummaryPath(const UBlueprintGraphExportSettings* Settings)
 	{
 		return BlueprintGraphExportPathUtils::ResolvePathAgainstOutputBase(
-			TEXT("Saved/BlueprintGraphAnalysis/BlueprintGraphExportRunSummary.json"),
+			TEXT("Saved/BlueprintGraphExport/BlueprintGraphExportRunSummary.json"),
 			Settings ? Settings : GetDefault<UBlueprintGraphExportSettings>()
 		);
 	}
@@ -207,7 +208,7 @@ namespace BlueprintGraphExportSyncRunnerPrivate
 				Asset = AssetData.GetAsset();
 			}
 
-			if (Asset && (Cast<UBlueprint>(Asset) || Cast<UDataAsset>(Asset)))
+			if (Asset && (Cast<UBlueprint>(Asset) || Cast<UDataAsset>(Asset) || Cast<UDataTable>(Asset)))
 			{
 				SupportedAssets.Add(AssetData);
 			}
@@ -655,17 +656,17 @@ FBlueprintGraphExportSyncOptions FBlueprintGraphExportSyncRunner::MakeOptionsFro
 
 	Options.DocumentationRootDir = BlueprintGraphExportSyncRunnerPrivate::ResolvePathValue(
 		EffectiveSettings ? EffectiveSettings->DocumentationRootDir : FString(),
-		TEXT("Docs/AssetMirror"),
+		TEXT("Saved/BlueprintGraphExport/Docs"),
 		EffectiveSettings
 	);
 	Options.JsonOutputDir = BlueprintGraphExportSyncRunnerPrivate::ResolvePathValue(
 		EffectiveSettings ? EffectiveSettings->JsonOutputDir : FString(),
-		TEXT("Saved/BlueprintGraphAnalysis"),
+		TEXT("Saved/BlueprintGraphExport/Json"),
 		EffectiveSettings
 	);
 	Options.ManifestPath = BlueprintGraphExportSyncRunnerPrivate::ResolvePathValue(
 		EffectiveSettings ? EffectiveSettings->StartupSyncManifestPath : FString(),
-		TEXT("Saved/BlueprintGraphAnalysis/StartupSyncManifest.json"),
+		TEXT("Saved/BlueprintGraphExport/StartupSyncManifest.json"),
 		EffectiveSettings
 	);
 	Options.SummaryPath = BlueprintGraphExportSyncRunnerPrivate::GetDefaultSummaryPath(EffectiveSettings);
